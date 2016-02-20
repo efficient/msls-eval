@@ -1,0 +1,327 @@
+diff --git a/db/compaction_picker.cc b/db/compaction_picker.cc
+index 02f53e5..502d98d 100644
+--- a/db/compaction_picker.cc
++++ b/db/compaction_picker.cc
+@@ -878,15 +878,37 @@ Compaction* LevelCompactionPicker::PickCompaction(
+     assert(i == 0 || score <= vstorage->CompactionScore(i - 1));
+     if (score >= 1) {
+       output_level = (level == 0) ? vstorage->base_level() : level + 1;
+-      if (PickCompactionBySize(vstorage, level, output_level, &inputs,
+-                               &parent_index, &base_index) &&
+-          ExpandWhileOverlapping(cf_name, vstorage, &inputs)) {
+-        // found the compaction!
+-        break;
++      // MSLS
++      //if (PickCompactionBySize(vstorage, level, output_level, &inputs,
++      //                         &parent_index, &base_index) &&
++      //    ExpandWhileOverlapping(cf_name, vstorage, &inputs)) {
++      //  // found the compaction!
++      //  break;
++      //} else {
++      //  // didn't find the compaction, clear the inputs
++      //  inputs.clear();
++      //}
++      if (!mutable_cf_options.use_leveldb_table_selection) {
++        if (PickCompactionBySize(vstorage, level, output_level, &inputs,
++                                 &parent_index, &base_index) &&
++            ExpandWhileOverlapping(cf_name, vstorage, &inputs)) {
++          // found the compaction!
++          break;
++        } else {
++          // didn't find the compaction, clear the inputs
++          inputs.clear();
++        }
+       } else {
+-        // didn't find the compaction, clear the inputs
+-        inputs.clear();
+-      }
++        if (PickCompactionLevelDB(vstorage, level, output_level, &inputs,
++                                  &parent_index, &base_index) &&
++            ExpandWhileOverlapping(cf_name, vstorage, &inputs)) {
++          // found the compaction!
++          break;
++        } else {
++          // didn't find the compaction, clear the inputs
++          inputs.clear();
++        }
++	  }
+     }
+   }
+ 
+@@ -1074,6 +1096,73 @@ bool LevelCompactionPicker::PickCompactionBySize(VersionStorageInfo* vstorage,
+   return inputs->size() > 0;
+ }
+ 
++// MSLS
++bool LevelCompactionPicker::PickCompactionLevelDB(VersionStorageInfo* vstorage,
++                                                  int level, int output_level,
++                                                  CompactionInputFiles* inputs,
++                                                  int* parent_index,
++                                                  int* base_index) {
++  // level 0 files are overlapping. So we cannot pick more
++  // than one concurrent compactions at this level. This
++  // could be made better by looking at key-ranges that are
++  // being compacted at level 0.
++  if (level == 0 && !level0_compactions_in_progress_.empty()) {
++    return false;
++  }
++
++  inputs->clear();
++
++  assert(level >= 0);
++
++  const std::vector<FileMetaData*>& level_files = vstorage->LevelFiles(level);
++
++  std::string last_key = vstorage->LastKey(level);
++  bool respect_last_key = true;
++
++  for (unsigned int i = 0; i < level_files.size() * 2; i++) {
++    int index = (vstorage->NextCompactionIndex(level) + i) % (int)level_files.size();
++    assert(index >= 0 && static_cast<size_t>(index) < level_files.size());
++
++    FileMetaData* f = level_files[index];
++
++    if (i != 0 && index == 0) {
++      if (respect_last_key) {
++        respect_last_key = false;
++      }
++    }
++
++    if (respect_last_key && f->smallest.Encode().ToString() < last_key) {
++      //printf("too small key\n");
++      continue;
++    }
++
++    // do not pick a file to compact if it is being compacted
++    // from n-1 level.
++    if (f->being_compacted) {
++      //printf("being compacted\n");
++      continue;
++    }
++
++    // Do not pick this file if its parents at level+1 are being compacted.
++    // Maybe we can avoid redoing this work in SetupOtherInputs
++    *parent_index = -1;
++    if (RangeInCompaction(vstorage, &f->smallest, &f->largest, output_level,
++                          parent_index)) {
++      //printf("parents being compacted\n");
++      continue;
++    }
++    inputs->files.push_back(f);
++    inputs->level = level;
++    *base_index = index;
++    vstorage->SetNextCompactionIndex(level, index);
++    vstorage->SetLastKey(level, f->largest.Encode().ToString());
++    //printf("%d %d %d/%zu %hhx %hhx\n", level, i, index, level_files.size(), last_key.c_str()[0], f->largest.Encode().ToString().c_str()[0]);
++    break;
++  }
++
++  return inputs->size() > 0;
++}
++
+ #ifndef ROCKSDB_LITE
+ bool UniversalCompactionPicker::NeedsCompaction(
+     const VersionStorageInfo* vstorage) const {
+diff --git a/db/compaction_picker.h b/db/compaction_picker.h
+index 1d1abe3..b30b3df 100644
+--- a/db/compaction_picker.h
++++ b/db/compaction_picker.h
+@@ -210,6 +210,13 @@ class LevelCompactionPicker : public CompactionPicker {
+                                                 VersionStorageInfo* vstorage,
+                                                 CompactionInputFiles* inputs,
+                                                 int* level, int* output_level);
++
++  // MSLS
++  // Similar to PickCompactionBySize except it chooses files
++  // in a round-robin fashion in the key space, like LevelDB does.
++  bool PickCompactionLevelDB(VersionStorageInfo* vstorage, int level,
++                             int output_level, CompactionInputFiles* inputs,
++                             int* parent_index, int* base_index);
+ };
+ 
+ #ifndef ROCKSDB_LITE
+diff --git a/db/version_set.cc b/db/version_set.cc
+index cedaa3e..73e45b1 100644
+--- a/db/version_set.cc
++++ b/db/version_set.cc
+@@ -795,7 +795,8 @@ VersionStorageInfo::VersionStorageInfo(
+       accumulated_num_deletions_(0),
+       num_samples_(0),
+       estimated_compaction_needed_bytes_(0),
+-      finalized_(false) {
++      finalized_(false),
++      last_key_(num_levels_) {
+   if (ref_vstorage != nullptr) {
+     accumulated_file_size_ = ref_vstorage->accumulated_file_size_;
+     accumulated_raw_key_size_ = ref_vstorage->accumulated_raw_key_size_;
+@@ -804,6 +805,7 @@ VersionStorageInfo::VersionStorageInfo(
+         ref_vstorage->accumulated_num_non_deletions_;
+     accumulated_num_deletions_ = ref_vstorage->accumulated_num_deletions_;
+     num_samples_ = ref_vstorage->num_samples_;
++    last_key_ = ref_vstorage->last_key_;
+   }
+ }
+ 
+@@ -1148,6 +1150,8 @@ void VersionStorageInfo::ComputeCompactionScore(
+       } else {
+         score = static_cast<double>(num_sorted_runs) /
+                 mutable_cf_options.level0_file_num_compaction_trigger;
++        // MSLS - The previous version of RocksDB used to priotize level-0 -> level-1 compaction, which caused starvation that disallows making level-2, level-3, ...
++        // This has been reverted back to LevelDB's method in newer RocksDB versions.
+       }
+     } else {
+       // Compute the ratio of current size to size limit.
+@@ -1803,6 +1807,13 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableCFOptions& ioptions,
+       }
+     }
+   }
++
++  // MSLS
++  for (auto i = 0u; i < options.custom_level_size_count; i++) {
++    if (i < level_max_bytes_.size()) {
++      level_max_bytes_[i] = options.custom_level_sizes[i];
++    }
++  }
+ }
+ 
+ uint64_t VersionStorageInfo::EstimateLiveDataSize() const {
+diff --git a/db/version_set.h b/db/version_set.h
+index 7707bb1..825ad62 100644
+--- a/db/version_set.h
++++ b/db/version_set.h
+@@ -323,6 +323,17 @@ class VersionStorageInfo {
+     return estimated_compaction_needed_bytes_;
+   }
+ 
++  // MSLS
++  void SetLastKey(int level, const std::string& last_key) {
++    assert(static_cast<size_t>(level) < last_key_.size());
++    last_key_[level] = last_key;
++  }
++
++  const std::string& LastKey(int level) {
++    assert(static_cast<size_t>(level) < last_key_.size());
++    return last_key_[level];
++  }
++
+  private:
+   const InternalKeyComparator* internal_comparator_;
+   const Comparator* user_comparator_;
+@@ -408,6 +419,9 @@ class VersionStorageInfo {
+   // No copying allowed
+   VersionStorageInfo(const VersionStorageInfo&) = delete;
+   void operator=(const VersionStorageInfo&) = delete;
++
++  // MSLS
++  std::vector<std::string> last_key_;
+ };
+ 
+ class Version {
+diff --git a/include/rocksdb/options.h b/include/rocksdb/options.h
+index 23b8507..294111c 100644
+--- a/include/rocksdb/options.h
++++ b/include/rocksdb/options.h
+@@ -1116,6 +1116,20 @@ struct DBOptions {
+   // Default: nullptr (disabled)
+   // Not supported in ROCKSDB_LITE mode!
+   std::shared_ptr<Cache> row_cache;
++
++  // MSLS: Use custom level sizes if custom_level_size_count != 0.
++  // custom_level_size_count is the maximum level number to change the size.
++  // custom_level_sizes[i] specifies the maximum size of level-i (i < custom_level_size_count).
++  // custom_level_sizes[0] is ignored.
++  //
++  // Default: 0, NULL
++  size_t custom_level_size_count;
++  const size_t* custom_level_sizes;
++
++  // MSLS: Use LevelDB-style circular table selection for compaction.
++  //
++  // Default: false
++  bool use_leveldb_table_selection;
+ };
+ 
+ // Options to control the behavior of a database (passed to DB::Open)
+diff --git a/util/crc32c.cc b/util/crc32c.cc
+index b8d281a..87d884d 100644
+--- a/util/crc32c.cc
++++ b/util/crc32c.cc
+@@ -394,7 +394,9 @@ bool IsFastCrc32Supported() {
+ Function ChosenExtend = Choose_Extend();
+ 
+ uint32_t Extend(uint32_t crc, const char* buf, size_t size) {
+-  return ChosenExtend(crc, buf, size);
++  // MSLS
++  return 0;
++  //return ChosenExtend(crc, buf, size);
+ }
+ 
+ }  // namespace crc32c
+diff --git a/util/mutable_cf_options.h b/util/mutable_cf_options.h
+index 4110ecc..38bb271 100644
+--- a/util/mutable_cf_options.h
++++ b/util/mutable_cf_options.h
+@@ -44,7 +44,10 @@ struct MutableCFOptions {
+         max_sequential_skip_in_iterations(
+             options.max_sequential_skip_in_iterations),
+         paranoid_file_checks(options.paranoid_file_checks),
+-        compaction_measure_io_stats(options.compaction_measure_io_stats)
++        compaction_measure_io_stats(options.compaction_measure_io_stats),
++        custom_level_size_count(options.custom_level_size_count),
++        custom_level_sizes(options.custom_level_sizes),
++        use_leveldb_table_selection(options.use_leveldb_table_selection)
+ 
+   {
+     RefreshDerivedOptions(ioptions);
+@@ -76,7 +79,10 @@ struct MutableCFOptions {
+         max_subcompactions(1),
+         max_sequential_skip_in_iterations(0),
+         paranoid_file_checks(false),
+-        compaction_measure_io_stats(false) {}
++        compaction_measure_io_stats(false),
++        custom_level_size_count(0),
++        custom_level_sizes(NULL),
++        use_leveldb_table_selection(false) {}
+ 
+   // Must be called after any change to MutableCFOptions
+   void RefreshDerivedOptions(const ImmutableCFOptions& ioptions);
+@@ -132,6 +138,11 @@ struct MutableCFOptions {
+   bool paranoid_file_checks;
+   bool compaction_measure_io_stats;
+ 
++  // MSLS
++  size_t custom_level_size_count;
++  const size_t* custom_level_sizes;
++  bool use_leveldb_table_selection;
++
+   // Derived options
+   // Per-level target file size.
+   std::vector<uint64_t> max_file_size;
+diff --git a/util/options.cc b/util/options.cc
+index 7f3bf75..d8ff0dd 100644
+--- a/util/options.cc
++++ b/util/options.cc
+@@ -250,7 +250,10 @@ DBOptions::DBOptions()
+       enable_thread_tracking(false),
+       delayed_write_rate(1024U * 1024U),
+       skip_stats_update_on_db_open(false),
+-      wal_recovery_mode(WALRecoveryMode::kTolerateCorruptedTailRecords) {
++      wal_recovery_mode(WALRecoveryMode::kTolerateCorruptedTailRecords),
++      custom_level_size_count(0),
++      custom_level_sizes(NULL),
++      use_leveldb_table_selection(false) {
+ }
+ 
+ DBOptions::DBOptions(const Options& options)
+@@ -305,7 +308,10 @@ DBOptions::DBOptions(const Options& options)
+       delayed_write_rate(options.delayed_write_rate),
+       skip_stats_update_on_db_open(options.skip_stats_update_on_db_open),
+       wal_recovery_mode(options.wal_recovery_mode),
+-      row_cache(options.row_cache) {}
++      row_cache(options.row_cache),
++      custom_level_size_count(options.custom_level_size_count),
++      custom_level_sizes(options.custom_level_sizes),
++      use_leveldb_table_selection(options.use_leveldb_table_selection) {}
+ 
+ static const char* const access_hints[] = {
+   "NONE", "NORMAL", "SEQUENTIAL", "WILLNEED"

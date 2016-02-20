@@ -1,0 +1,104 @@
+diff --git a/db/dbformat.h b/db/dbformat.h
+index 5d8a032..20cccec 100644
+--- a/db/dbformat.h
++++ b/db/dbformat.h
+@@ -25,10 +25,12 @@ static const int kNumLevels = 7;
+ static const int kL0_CompactionTrigger = 4;
+ 
+ // Soft limit on number of level-0 files.  We slow down writes at this point.
+-static const int kL0_SlowdownWritesTrigger = 8;
++//static const int kL0_SlowdownWritesTrigger = 8;
++static const int kL0_SlowdownWritesTrigger = 4;
+ 
+ // Maximum number of level-0 files.  We stop writes at this point.
+-static const int kL0_StopWritesTrigger = 12;
++//static const int kL0_StopWritesTrigger = 12;
++static const int kL0_StopWritesTrigger = 4;
+ 
+ // Maximum level to which a new compacted memtable is pushed if it
+ // does not create overlap.  We try to push to level 2 to avoid the
+diff --git a/db/version_set.cc b/db/version_set.cc
+index aa83df5..f5d8937 100644
+--- a/db/version_set.cc
++++ b/db/version_set.cc
+@@ -1038,7 +1038,13 @@ void VersionSet::Finalize(Version* v) {
+     } else {
+       // Compute the ratio of current size to size limit.
+       const uint64_t level_bytes = TotalFileSize(v->files_[level]);
+-      score = static_cast<double>(level_bytes) / MaxBytesForLevel(level);
++      // score = static_cast<double>(level_bytes) / MaxBytesForLevel(level);
++	  // MSLS
++	  if (level < options_->custom_level_size_count)
++        score = static_cast<double>(level_bytes) / static_cast<double>(options_->custom_level_sizes[level]);
++	  else {
++        score = static_cast<double>(level_bytes) / MaxBytesForLevel(level);
++      }
+     }
+ 
+     if (score > best_score) {
+@@ -1286,6 +1292,8 @@ Compaction* VersionSet::PickCompaction() {
+     // c->inputs_[0] earlier and replace it with an overlapping set
+     // which will include the picked file.
+     current_->GetOverlappingInputs(0, &smallest, &largest, &c->inputs_[0]);
++    // MSLS - test
++    //current_->GetOverlappingInputs(0, NULL, NULL, &c->inputs_[0]);
+     assert(!c->inputs_[0].empty());
+   }
+ 
+diff --git a/include/leveldb/options.h b/include/leveldb/options.h
+index fdda718..a6955d4 100644
+--- a/include/leveldb/options.h
++++ b/include/leveldb/options.h
+@@ -135,6 +135,15 @@ struct Options {
+   // Default: NULL
+   const FilterPolicy* filter_policy;
+ 
++  // MSLS: Use custom level sizes if custom_level_size_count != 0.
++  // custom_level_size_count is the maximum level number to change the size.
++  // custom_level_sizes[i] specifies the maximum size of level-i (i < custom_level_size_count).
++  // custom_level_sizes[0] is ignored.
++  //
++  // Default: 0, NULL
++  size_t custom_level_size_count;
++  const size_t* custom_level_sizes;
++
+   // Create an Options object with default values for all fields.
+   Options();
+ };
+diff --git a/util/crc32c.cc b/util/crc32c.cc
+index 6db9e77..7adb5f9 100644
+--- a/util/crc32c.cc
++++ b/util/crc32c.cc
+@@ -284,6 +284,9 @@ static inline uint32_t LE_LOAD32(const uint8_t *p) {
+ }
+ 
+ uint32_t Extend(uint32_t crc, const char* buf, size_t size) {
++  // MSLS
++  return 0;
++  /*
+   const uint8_t *p = reinterpret_cast<const uint8_t *>(buf);
+   const uint8_t *e = p + size;
+   uint32_t l = crc ^ 0xffffffffu;
+@@ -326,6 +329,7 @@ uint32_t Extend(uint32_t crc, const char* buf, size_t size) {
+ #undef STEP4
+ #undef STEP1
+   return l ^ 0xffffffffu;
++  */
+ }
+ 
+ }  // namespace crc32c
+diff --git a/util/options.cc b/util/options.cc
+index 76af5b9..98ff188 100644
+--- a/util/options.cc
++++ b/util/options.cc
+@@ -22,7 +22,9 @@ Options::Options()
+       block_size(4096),
+       block_restart_interval(16),
+       compression(kSnappyCompression),
+-      filter_policy(NULL) {
++      filter_policy(NULL),
++      custom_level_size_count(0),
++      custom_level_sizes(NULL) {
+ }
+ 
+ 
